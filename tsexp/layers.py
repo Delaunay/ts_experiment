@@ -80,12 +80,13 @@ class Differential(nn.Module):
         self.out_channel = out_channel
         in_channel = n
         kernel = torch.randn(out_channel, in_channel, k).float()
+        kernel[:] = 0
 
         for i in range(n):
             kernel[i, i, :] = filter
-            kernel[i, i, :] = filter
 
-        self.kernel = nn.Parameter(kernel)
+        self.kernel = nn.Parameter(kernel, requires_grad=True)
+        # print(self.kernel)
 
     def forward(self, x):
         """
