@@ -20,10 +20,10 @@ class Quadratic(nn.Module):
     >>> result.shape
     torch.Size([3, 10, 10])
     """
-    def __init__(self, input_shape):
+    def __init__(self, input_shape, eps=1e-1):
         super(Quadratic, self).__init__()
         _, m = input_shape
-        self.A = nn.Parameter(torch.eye(m, dtype=torch.float32))
+        self.A = nn.Parameter(torch.eye(m, dtype=torch.float32) + eps * torch.randn(m, m).float())
 
     def forward(self, x):
         """
@@ -38,7 +38,7 @@ class Quadratic(nn.Module):
         """
         xt = x.transpose(2, 1)
         r1 = torch.matmul(x, self.A)
-        return torch.matmul(r1, xt)
+        return torch.matmul(r1, xt) / self.A.sum()
 
 
 class Differential(nn.Module):
@@ -66,7 +66,7 @@ class Differential(nn.Module):
     >>> torch.abs(result[0, 0, 0] - (x[0, 0, 2] - x[0, 0, 1])) < 1e-4
     tensor(True)
     """
-    def __init__(self, input_shape, k=2, out_channel=None):
+    def __init__(self, input_shape, k=2, out_channel=None, eps=1e-1):
         super(Differential, self).__init__()
         n, _ = input_shape
 
@@ -79,12 +79,12 @@ class Differential(nn.Module):
 
         self.out_channel = out_channel
         in_channel = n
-        kernel = torch.randn(out_channel, in_channel, k).float()
-        kernel[:] = 0
+        kernel = torch.zeros(out_channel, in_channel, k).float()
 
         for i in range(n):
             kernel[i, i, :] = filter
 
+        kernel = kernel + eps * torch.randn(out_channel, in_channel, k).float()
         self.kernel = nn.Parameter(kernel, requires_grad=True)
         # print(self.kernel)
 
@@ -129,6 +129,17 @@ class Barycenter(nn.Module):
     def forward(self, x):
         return torch.matmul(x, self.weight / self.weight.sum())
 
+    def smooth(self, steps=4):
+        n, _ = self.weight.shape
+        new_weight = torch.zeros_like(self.weight)
+
+        for i in range(n):
+            s = max(i - steps // 2, 0)
+            e = min(i + steps // 2, n)
+            new_weight[i] = self.weight[s:e].median()
+
+        self.weight = nn.Parameter(new_weight / new_weight.sum())
+
 
 class Covariance(nn.Module):
     """Compute the covariance matrix
@@ -151,18 +162,17 @@ class Covariance(nn.Module):
 
     Examples
     --------
-    >>> cov = Covariance((10, 20), k=3, bias=True)
+    >>> cov = Covariance((10, 20), k=3, bias=True, eps=0)
     >>> batch_size = 3
     >>> x = torch.randn((batch_size, 10, 20))
     >>> result = cov(x)
     >>> result.shape
     torch.Size([3, 10, 10])
     >>> import numpy as np
-    >>> ret = (x[0, :, 1:] - x[0, :, 0:-1]).numpy()
+    >>> ret = (x[0, :, 2:] - x[0, :, 1:-1]).numpy()
     >>> numpy_cov = np.cov(ret, bias=True)
     >>> torch.abs(result[0, :, :] - torch.from_numpy(numpy_cov)).sum() < 1e-5
     tensor(True)
-
 
     >>> cov = Covariance((10, 20), k=3, channels=100, bias=True)
     >>> batch_size = 3
@@ -171,21 +181,20 @@ class Covariance(nn.Module):
     >>> result.shape
     torch.Size([3, 100, 100])
     """
-    def __init__(self, input_shape, k=2, channels=None, bias=True):
+    def __init__(self, input_shape, k=2, channels=None, bias=True, eps=1e-4):
         super(Covariance, self).__init__()
 
         n, m = input_shape
 
-        self.diff = Differential((n, m), k=k, out_channel=channels)   # x_t - x_{t - 1}
+        self.diff = Differential((n, m), k=k, out_channel=channels, eps=eps)   # x_t - x_{t - 1}
         n = self.diff.out_channel
 
-        self.quadratic = Quadratic((n, m - (k - 1)))  # r * r^T
-        self.mean = Barycenter((n, m - (k - 1)))      # r * 1
+        self.quadratic = Quadratic((n, m - (k - 1)), eps=eps)  # r * r^T
+        self.mean = Barycenter((n, m - (k - 1)))               # r * 1
 
-        if bias:
-            self.m = m - 1
-        else:
-            self.m = m - 2
+        self.m = m - (k - 1)
+        if not bias:
+            self.m -= 1
 
     def forward(self, x):
         returns = self.diff(x)
@@ -193,4 +202,38 @@ class Covariance(nn.Module):
         squared = self.quadratic(returns)
         mean    = self.mean(returns)
 
-        return squared / self.m - torch.matmul(mean, mean.transpose(2, 1))
+        return squared - torch.matmul(mean, mean.transpose(2, 1))
+
+    def smooth(self):
+        self.mean.smooth()
+
+
+class SharpeRatio:
+    """
+    https://en.wikipedia.org/wiki/Sharpe_ratio
+
+    You want to maximize the Sharpe ratio
+
+    Examples
+    --------
+    >>> batch_size = 3
+    >>> cov = torch.randn(batch_size, 10, 10)
+    >>> returns = torch.randn(batch_size, 10)
+    >>> weight = torch.randn(batch_size, 10)
+    >>> crit = SharpeRatio()
+    >>> sharp_ratios = crit(weight, cov, returns)
+    >>> sharp_ratios.shape
+    torch.Size([3, 1])
+    """
+
+    def __call__(self, weight, cov, returns):
+        if len(weight.shape) != 3:
+            weight = weight.unsqueeze(2)
+
+        if len(returns.shape) != 3:
+            returns = returns.unsqueeze(2)
+
+        returns = torch.matmul(returns.transpose(2, 1), weight)
+        std = torch.sqrt(torch.matmul(torch.matmul(weight.transpose(2, 1), cov), weight))
+        return (returns / std).squeeze(2)
+
